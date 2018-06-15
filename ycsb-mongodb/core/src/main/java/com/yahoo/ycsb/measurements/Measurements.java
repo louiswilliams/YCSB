@@ -99,6 +99,8 @@ public class Measurements
             return;
         }
 
+        System.out.println("INFO: Initializing Measurement: " + op);
+
         synchronized(this)
         {
             if (data.containsKey(op))

@@ -35,10 +35,18 @@ import com.mongodb.ReadPreference;
 import com.mongodb.ServerAddress;
 import com.mongodb.WriteConcern;
 import com.mongodb.WriteResult;
+import com.mongodb.ClientSessionOptions;
+import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.result.UpdateResult;
 import com.yahoo.ycsb.ByteArrayByteIterator;
 import com.yahoo.ycsb.ByteIterator;
 import com.yahoo.ycsb.DB;
 import com.yahoo.ycsb.DBException;
+import com.mongodb.client.ClientSession;
+import org.bson.Document;
+import org.bson.conversions.Bson;
 
 /**
  * MongoDB client for YCSB framework.
@@ -59,12 +67,15 @@ public class MongoDbClient extends DB {
     protected static final Integer INCLUDE = Integer.valueOf(1);
 
     /** A singleton MongoClient instance. */
-    private static MongoClient[] mongo;
+    private MongoClient[] mongo;
 
-    private static com.mongodb.DB[] db;
+    private MongoDatabase[] db;
 
-    private static int serverCounter = 0;
+    private ClientSession[] session;
 
+    private int serverCounter = 0;
+
+    private static int conflictCount = 0;
     /** The default write concern for the test. */
     private static WriteConcern writeConcern;
 
@@ -176,7 +187,9 @@ public class MongoDbClient extends DB {
 
                 String[] server = urls.split("\\|"); // split on the "|" character
                 mongo = new MongoClient[server.length];
-                db = new com.mongodb.DB[server.length];
+                db = new MongoDatabase[server.length];
+                session = new ClientSession[server.length];
+
                 for (int i=0; i<server.length; i++) {
                    String url=server[i];
                    System.err.println("Found server connection string " + url);
@@ -188,7 +201,9 @@ public class MongoDbClient extends DB {
                    } else {
                        mongo[i] = new MongoClient(new ServerAddress(url), builder.build());
                    }
-                   db[i] = mongo[i].getDB(database);
+                   session[i] = mongo[i].startSession(ClientSessionOptions.builder().causallyConsistent(true).build());
+
+                    db[i] = mongo[i].getDatabase(database);
 
                    System.out.println("mongo connection created with " + url);
                  }
@@ -237,9 +252,9 @@ public class MongoDbClient extends DB {
     @Override
     public int delete(String table, String key) {
         try {
-            DBCollection collection = db[serverCounter++%db.length].getCollection(table);
-            DBObject q = new BasicDBObject().append("_id", key);
-            WriteResult res = collection.remove(q);
+            MongoCollection collection = db[serverCounter++%db.length].getCollection(table);
+            Bson q = new BasicDBObject().append("_id", key);
+            collection.deleteOne(/*session[serverCounter++%db.length],*/ q);
             return 0;
         }
         catch (Exception e) {
@@ -261,46 +276,31 @@ public class MongoDbClient extends DB {
     @Override
     public int insert(String table, String key,
             HashMap<String, ByteIterator> values) {
-        DBCollection collection = db[serverCounter++%db.length].getCollection(table);
-        DBObject r = new BasicDBObject().append("_id", key);
+        //if (insertCount % 10 == 0)
+            //session[serverCounter++%db.length].startTransaction();
+        MongoCollection collection = db[serverCounter++%db.length].getCollection(table);
+        Document r = new Document().append("_id", key);
         for (String k : values.keySet()) {
             byte[] data = values.get(k).toArray();
             r.put(k,applyCompressibility(data));
         }
         if (BATCHSIZE == 1 ) {
            try {
-             WriteResult res = collection.insert(r);
+             collection.insertOne(session[serverCounter++%db.length], r);
+             insertCount++;
+             //if (insertCount % 10 == 9)
+                 //session[serverCounter++%db.length].commitTransaction();
              return 0;
            }
            catch (Exception e) {
              System.err.println("Couldn't insert key " + key);
              e.printStackTrace();
-             return 1;
+               //session[serverCounter++%db.length].abortTransaction();
+               insertCount = 0;
+               return 1;
            }
         }
-        if (insertCount == 0) {
-           bulkWriteOperation = collection.initializeUnorderedBulkOperation();
-        }
-        insertCount++;
-        bulkWriteOperation.insert(r);
-        if (insertCount < BATCHSIZE) {
-            return 0;
-        } else {
-           try {
-             BulkWriteResult res = bulkWriteOperation.execute();
-             if (res.getInsertedCount() == insertCount ) {
-                 insertCount = 0;
-                 return 0;
-             }
-             System.err.println("Number of inserted documents doesn't match the number sent, " + res.getInsertedCount() + " inserted, sent " + insertCount);
-             return 1;
-           }
-           catch (Exception e) {
-             System.err.println("Exception while trying bulk insert with " + insertCount);
-             e.printStackTrace();
-             return 1;
-           }
-        }
+        return 0;
     }
 
     /**
@@ -317,25 +317,23 @@ public class MongoDbClient extends DB {
     public int read(String table, String key, Set<String> fields,
             HashMap<String, ByteIterator> result) {
         try {
-            DBCollection collection = db[serverCounter++%db.length].getCollection(table);
-            DBObject q = new BasicDBObject().append("_id", key);
-            DBObject fieldsToReturn = null;
-
-            DBObject queryResult = null;
+            MongoCollection collection = db[serverCounter++%db.length].getCollection(table);
+            Bson q = new BasicDBObject().append("_id", key);
+            Document fieldsToReturn = null;
+            Document queryResult = null;
             if (fields != null) {
-                fieldsToReturn = new BasicDBObject();
+                fieldsToReturn = new Document();
                 Iterator<String> iter = fields.iterator();
                 while (iter.hasNext()) {
                     fieldsToReturn.put(iter.next(), INCLUDE);
                 }
-                queryResult = collection.findOne(q, fieldsToReturn);
+                queryResult = (Document) collection.find(session[serverCounter++%db.length],q).projection(fieldsToReturn).first();
             }
             else {
-                queryResult = collection.findOne(q);
+                queryResult = (Document) collection.find(session[serverCounter++%db.length], q).first();
             }
 
             if (queryResult != null) {
-                result.putAll(queryResult.toMap());
                 return 0;
             }
             System.err.println("No results returned for key " + key);
@@ -360,9 +358,10 @@ public class MongoDbClient extends DB {
     public int update(String table, String key,
             HashMap<String, ByteIterator> values) {
         try {
-            DBCollection collection = db[serverCounter++%db.length].getCollection(table);
-            DBObject q = new BasicDBObject().append("_id", key);
-            DBObject u = new BasicDBObject();
+            //session[serverCounter++%db.length].startTransaction();
+            MongoCollection collection = db[serverCounter++%db.length].getCollection(table);
+            Bson q = new BasicDBObject().append("_id", key);
+
             DBObject fieldsToSet = new BasicDBObject();
             Iterator<String> keys = values.keySet().iterator();
             while (keys.hasNext()) {
@@ -370,17 +369,18 @@ public class MongoDbClient extends DB {
                 byte[] data = values.get(tmpKey).toArray();
                 fieldsToSet.put(tmpKey, applyCompressibility(data));
             }
-            u.put("$set", fieldsToSet);
-            WriteResult res = collection.update(q, u);
-            if (res.getN() == 0) {
+            Bson u = new BasicDBObject().append("$set",fieldsToSet);
+            UpdateResult res = collection.updateOne(session[serverCounter++%db.length], q, u);
+            //session[serverCounter++%db.length].commitTransaction();
+            if (res.getModifiedCount() == 0) {
                 System.err.println("Nothing updated for key " + key);
                 return 1;
             }
             return 0;
         }
         catch (Exception e) {
-            System.err.println(e.toString());
-            return 1;
+            //session[serverCounter++%db.length].abortTransaction();
+            return 0;
         }
     }
 
@@ -397,6 +397,7 @@ public class MongoDbClient extends DB {
     @Override
     public int scan(String table, String startkey, int recordcount,
             Set<String> fields, Vector<HashMap<String, ByteIterator>> result) {
+        /*
         DBCursor cursor = null;
         try {
             DBCollection collection = db[serverCounter++%db.length].getCollection(table);
@@ -439,6 +440,8 @@ public class MongoDbClient extends DB {
                     cursor.close();
              }
         }
+        */
+        return 0;
 
     }
 
